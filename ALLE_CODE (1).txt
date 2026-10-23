@@ -1,0 +1,1380 @@
+# Buitenspeelwijzer – alle code in één bestand
+# Elk deel hieronder is een apart bestand in de projectmap.
+
+
+# ======================================================================
+# Bestand: app.py
+# ======================================================================
+
+"""Buitenspeelwijzer – start met: streamlit run app.py"""
+
+from datetime import date
+
+import streamlit as st
+
+import stijlen
+from knmi import activiteiten, datum, db, locatie, score, weer
+
+st.set_page_config(page_title="Buitenspeelwijzer", page_icon="🌳", layout="centered")
+
+
+@st.cache_data(ttl=3600)
+def periode() -> db.Periode:
+    # Na `python3 bijwerken.py` schuift de periode binnen een uur vanzelf mee.
+    return db.huidige_periode()
+
+
+@st.cache_data
+def stations(p: db.Periode) -> list[db.Station]:
+    return db.bruikbare_stations(p)
+
+
+@st.cache_data
+def metingen(stn: int, mmdd: str, p: db.Periode) -> list[dict]:
+    return db.metingen_op_kalenderdag(stn, mmdd, p)
+
+
+@st.cache_data
+def telling(stn: int, alleen_weekend: bool, p: db.Periode) -> weer.Telling:
+    return weer.tel_speeldagen(db.max_temperaturen(stn, p), p.begin, p.eind, alleen_weekend)
+
+
+def kies_dag(d: date) -> None:
+    st.session_state.dag = d
+
+
+def kies_andere_dag() -> None:
+    if st.session_state.andere_dag:
+        st.session_state.dag = st.session_state.andere_dag
+
+
+def andere_ideeen() -> None:
+    st.session_state.ververs = st.session_state.get("ververs", 0) + 1
+
+
+def html(inhoud: str) -> None:
+    st.markdown(inhoud, unsafe_allow_html=True)
+
+
+def kop(tekst: str, emoji: str, stap: int | None = None) -> None:
+    """Kopje boven een onderdeel. In de stoepkrijt-stijl krijgen de stappen
+    een genummerd hinkelbaanvak in plaats van een emoji."""
+    if stijl == stijlen.KRIJT and stap:
+        teken = f'<span class="bsw-hink bsw-hink--{stap}">{stap}</span>'
+    else:
+        teken = f'<span aria-hidden="true">{emoji}</span>'
+    html(f'<h3 class="bsw-kop">{teken}{tekst}</h3>')
+
+
+def idee_kaart(advies: activiteiten.Advies, soort: str) -> None:
+    kans = (
+        f'<div class="bsw-idee-kans">Het weer paste erbij in ongeveer '
+        f"{weer.kans_tekst(advies.jaren, db.AANTAL_JAREN)} jaar.</div>"
+        if advies.jaren is not None
+        else ""
+    )
+    html(
+        f'<div class="bsw-vak bsw-idee bsw-idee--{soort}">'
+        f'<div class="bsw-idee-emoji" aria-hidden="true">{advies.emoji}</div>'
+        f'<div><div class="bsw-idee-naam">{advies.naam}</div><div>{advies.tip}</div>{kans}</div>'
+        "</div>"
+    )
+
+
+# --- Stijl kiezen -------------------------------------------------------------
+if "stijl" not in st.session_state:
+    gevraagd = st.query_params.get("stijl")
+    st.session_state.stijl = gevraagd if gevraagd in stijlen.STIJLEN else stijlen.ZONNIG
+
+st.title("🌳 Buitenspeelwijzer")
+st.segmented_control(
+    "Kies je stijl",
+    list(stijlen.STIJLEN),
+    format_func=stijlen.STIJLEN.get,
+    key="stijl",
+)
+stijl = st.session_state.stijl or stijlen.ZONNIG
+
+p = periode()
+st.caption(
+    "Dit is geen weersvoorspelling, maar hoe het weer de afgelopen 30 jaar was "
+    f"({datum.datum_met_jaar(p.begin)} tot en met {datum.datum_met_jaar(p.eind)})."
+)
+
+# --- Story 1: plaats intypen -------------------------------------------------
+kop("Waar woon je?", "📍", stap=1)
+with st.form("plaats"):
+    tekst = st.text_input(
+        "Plaats of postcode", placeholder="Bijvoorbeeld Utrecht of 3511AB"
+    )
+    zoeken = st.form_submit_button("Zoeken", type="primary")
+
+if zoeken and tekst.strip():
+    try:
+        gevonden = locatie.zoek_locatie(tekst)
+    except locatie.LocatieServiceFout:
+        st.error("Oeps, we kunnen nu geen plaatsen opzoeken. Probeer het straks nog eens.")
+    else:
+        if gevonden is None:
+            st.warning("Die plaats kennen we niet. Probeer een andere naam of je postcode.")
+        else:
+            station, km = locatie.dichtstbijzijnd_station(
+                gevonden.lat, gevonden.lon, stations(p)
+            )
+            st.session_state.plek = (gevonden, station, km)
+
+if "plek" not in st.session_state:
+    st.html(stijlen.css(stijl, weer.BUITEN))
+    st.info("Kies eerst je plaats.")
+    st.stop()
+
+plek, station, km = st.session_state.plek
+st.success(f"We gebruiken weerstation **{station.naam}** ({km:.0f} km van {plek.naam}).")
+if km > locatie.VER_WEG_KM:
+    st.warning("Dit station ligt ver weg, het weer kan bij jou anders zijn.")
+
+# --- Story 2: weekenddag kiezen ----------------------------------------------
+kop("Welke dag wil je buitenspelen?", "📅", stap=2)
+weekend = datum.komend_weekend(date.today())
+st.session_state.setdefault("dag", weekend[0])
+
+with st.container(horizontal=True):
+    for d in weekend:
+        st.button(
+            datum.knop_label(d),
+            type="primary" if st.session_state.dag == d else "secondary",
+            on_click=kies_dag,
+            args=(d,),
+            width="stretch",
+        )
+
+with st.expander("Andere dag kiezen"):
+    st.date_input(
+        "Kies een dag",
+        value=None,
+        min_value=date(1900, 1, 1),
+        max_value=date(2100, 12, 31),
+        key="andere_dag",
+        on_change=kies_andere_dag,
+        format="DD-MM-YYYY",
+    )
+
+dag = st.session_state.dag
+st.write(f"Je hebt gekozen: **{datum.dag_label(dag)}**")
+if datum.is_schrikkeldag(dag):
+    st.info("29 februari komt maar eens in de vier jaar voor. Daarom kijken we naar 28 februari.")
+
+# --- Story 3, 4 en 9: is het buitenspeelweer, score en kans -------------------
+dag_metingen = metingen(station.stn, datum.kalenderdag(dag), p)
+oordeel = weer.buitenspeel_oordeel(dag_metingen)
+dagscore = score.dag_score(dag_metingen)
+score_tekst, _ = score.score_label(dagscore)
+
+# De achtergrond van de zonnige stijl kleurt mee met het advies.
+st.html(stijlen.css(stijl, oordeel.soort))
+
+icoon = "☀️" if oordeel.soort == weer.BUITEN else "🏠"
+x = weer.van_de_tien(oordeel.buitendagen, oordeel.totaal)
+
+with st.container(key="oordeel"):
+    html(
+        f'<div class="bsw-vak bsw-oordeel bsw-oordeel--{oordeel.soort}">'
+        f'<div class="bsw-oordeel-tekst"><div class="bsw-oordeel-icoon" aria-hidden="true">{icoon}</div>'
+        f'<div class="bsw-oordeel-titel">{oordeel.tekst}</div></div>'
+        f'<div class="bsw-score bsw-score--{score.score_niveau(dagscore)}">'
+        f'<div class="bsw-score-rondje"><div class="bsw-score-getal">{dagscore}</div>'
+        f'<div class="bsw-score-van">van 100</div></div>'
+        f'<div class="bsw-score-tekst">{score_tekst}</div></div>'
+        "</div>"
+    )
+    html(
+        f'<div class="bsw-plaatjes" role="img" aria-label="{x} van de 10 jaar buitenspeelweer">'
+        f'{"☀️" * x}{"🏠" * (10 - x)}</div>'
+    )
+    st.write(
+        f"In ongeveer **{weer.kans_tekst(oordeel.buitendagen, oordeel.totaal)} jaar** "
+        f"was het op {datum.datum_zonder_jaar(dag)} buitenspeelweer."
+    )
+    detail = f"Precies: {oordeel.buitendagen} van de {oordeel.totaal} jaar 15 graden of warmer."
+    if oordeel.gem_max_temp is not None:
+        detail += f" Meestal werd het ongeveer {oordeel.gem_max_temp:.0f} graden."
+    st.caption(detail)
+    st.caption("Score: 🟢 60 of meer is top, 🟠 40 tot 60 is best oké, 🔴 onder 40 is niet zo goed.")
+
+# --- Story 5 en 8: wat kun je gaan doen? -------------------------------------
+# De loting hangt af van de dag, zodat je op andere dagen andere ideeën ziet.
+seed = dag.toordinal() * 100 + st.session_state.get("ververs", 0)
+with st.container(key="ideeen"):
+    if oordeel.soort == weer.BUITEN:
+        kop("Wat kun je buiten gaan doen?", "🎯", stap=3)
+        ideeen = activiteiten.top_activiteiten(dag_metingen, seed=seed)
+    else:
+        kop("Binnenopdrachten (zonder gamen!)", "🏠", stap=3)
+        ideeen = activiteiten.binnenopdrachten(seed=seed)
+
+    for advies in ideeen:
+        idee_kaart(advies, oordeel.soort)
+
+    st.button("🔄 Andere ideeën", on_click=andere_ideeen, width="stretch")
+
+# --- Story 6 en 7: plan B bij regen of hitte ---------------------------------
+if oordeel.soort == weer.BUITEN:
+    getoond = {a.naam for a in ideeen}
+    regen_idee = activiteiten.plan_b(dag_metingen, "regen", getoond, seed)
+    hitte_idee = activiteiten.plan_b(dag_metingen, "heet", getoond, seed)
+    if regen_idee or hitte_idee:
+        with st.container(key="plan_b"):
+            if regen_idee:
+                kop("Regent het toch?", "🌧️")
+                idee_kaart(regen_idee, "regen")
+            if hitte_idee:
+                kop("Wordt het heel warm?", "🥵")
+                idee_kaart(hitte_idee, "heet")
+                st.write("💧 Drink genoeg water en smeer je in!")
+
+# --- Story 13: hoeveel buitenspeeldagen per jaar? ----------------------------
+with st.container(key="telling"):
+    kop("Hoeveel buitenspeeldagen heb je per jaar?", "📊")
+    keuze = st.segmented_control(
+        "Welke dagen tellen?",
+        ["Alle dagen", "Alleen weekend"],
+        default="Alle dagen",
+        key="telwijze",
+    )
+    alleen_weekend = keuze == "Alleen weekend"
+    t = telling(station.stn, alleen_weekend, p)
+    soort_dagen = "weekenddagen" if alleen_weekend else "dagen"
+    html(
+        '<div class="bsw-tegels">'
+        f'<div class="bsw-vak bsw-tegel bsw-tegel--buiten"><div class="bsw-tegel-getal">'
+        f"☀️ {t.buiten_per_jaar:.0f}</div><div>buitenspeeldagen</div></div>"
+        f'<div class="bsw-vak bsw-tegel bsw-tegel--binnen"><div class="bsw-tegel-getal">'
+        f"🏠 {t.binnen_per_jaar:.0f}</div><div>binnendagen</div></div>"
+        "</div>"
+    )
+    st.write(
+        f"Bij weerstation {station.naam} kon je gemiddeld op **{t.buiten_per_jaar:.0f} "
+        f"van de {t.dagen_per_jaar:.0f} {soort_dagen}** per jaar buitenspelen."
+    )
+
+
+# ======================================================================
+# Bestand: stijlen.py
+# ======================================================================
+
+"""Twee vormgevingen voor de Buitenspeelwijzer.
+
+zonnig – "Zonnige wijk": een getekende wijk als achtergrond die meekleurt met
+         het advies (zon en vlieger bij buitenspeelweer, regen en verlichte
+         ramen bij een binnendag). De inhoud staat op een stevig "bord".
+krijt  – "Stoepkrijt": stoeptegels met krijttekeningen. De stappen zijn
+         genummerd als een hinkelbaan.
+"""
+
+from urllib.parse import quote
+
+ZONNIG = "zonnig"
+KRIJT = "krijt"
+STIJLEN = {ZONNIG: "☀️ Zonnige wijk", KRIJT: "🖍️ Stoepkrijt"}
+
+FONTS = (
+    "@import url('https://fonts.googleapis.com/css2?"
+    "family=Lexend:wght@400;600&family=Fredoka:wght@500;600;700"
+    "&family=Gochi+Hand&display=swap');"
+)
+
+
+def _svg_url(svg: str) -> str:
+    return f'url("data:image/svg+xml,{quote(svg, safe="")}")'
+
+
+# --- Zonnige wijk: achtergrondscènes ------------------------------------------
+
+def _huizen(raam: str) -> str:
+    """Een rij huisjes op de horizon; `raam` is de kleur van de ramen."""
+    huizen = [
+        (180, "#FF8C69"), (300, "#FFD166"), (420, "#7CC6FF"),
+        (1080, "#C3A6FF"), (1200, "#FF8C69"), (1320, "#FFD166"),
+    ]
+    delen = []
+    for x, muur in huizen:
+        delen.append(
+            f'<rect x="{x}" y="735" width="90" height="85" rx="6" fill="{muur}" '
+            f'stroke="#1E2A4A" stroke-width="5"/>'
+            f'<path d="M{x - 10} 740 L{x + 45} 690 L{x + 100} 740 Z" fill="#E94F64" '
+            f'stroke="#1E2A4A" stroke-width="5" stroke-linejoin="round"/>'
+            f'<rect x="{x + 14}" y="755" width="22" height="22" rx="3" fill="{raam}" '
+            f'stroke="#1E2A4A" stroke-width="4"/>'
+            f'<rect x="{x + 54}" y="770" width="22" height="50" rx="3" fill="#1E2A4A"/>'
+        )
+    return "".join(delen)
+
+
+def _boom(x: int, y: int) -> str:
+    return (
+        f'<rect x="{x - 8}" y="{y}" width="16" height="60" fill="#8B5E3C"/>'
+        f'<circle cx="{x}" cy="{y - 10}" r="48" fill="#2FA35A" stroke="#1E2A4A" stroke-width="5"/>'
+    )
+
+
+def _heuvels(achter: str, voor: str) -> str:
+    return (
+        f'<path d="M0 760 C 300 660 600 700 800 740 C 1050 790 1300 650 1600 720 '
+        f'L1600 1000 L0 1000 Z" fill="{achter}"/>'
+        f'<path d="M0 820 C 350 760 700 860 1000 820 C 1250 785 1450 800 1600 830 '
+        f'L1600 1000 L0 1000 Z" fill="{voor}"/>'
+    )
+
+
+def _wolk(x: int, y: int, kleur: str, schaal: float = 1) -> str:
+    return (
+        f'<g transform="translate({x} {y}) scale({schaal})" fill="{kleur}">'
+        '<ellipse cx="0" cy="0" rx="90" ry="45"/><circle cx="-45" cy="-20" r="45"/>'
+        '<circle cx="30" cy="-40" r="55"/><circle cx="85" cy="-5" r="40"/></g>'
+    )
+
+
+SCENE_BUITEN = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" '
+    'preserveAspectRatio="xMidYMax slice">'
+    '<defs><linearGradient id="l" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#5EC4FF"/><stop offset="1" stop-color="#DDF3FF"/>'
+    "</linearGradient></defs>"
+    '<rect width="1600" height="1000" fill="url(#l)"/>'
+    '<g transform="translate(1360 170)">'
+    + "".join(
+        f'<rect x="-8" y="-150" width="16" height="45" rx="8" fill="#FFB020" '
+        f'transform="rotate({hoek})"/>'
+        for hoek in range(0, 360, 30)
+    )
+    + '<circle r="92" fill="#FFC93C" stroke="#1E2A4A" stroke-width="6"/></g>'
+    + _wolk(330, 150, "#FFFFFF")
+    + _wolk(820, 130, "#FFFFFF", 0.8)
+    + _wolk(1120, 330, "#FFFFFF", 0.6)
+    # vlieger met staart
+    + '<path d="M150 330 L210 400 L150 490 L90 400 Z" fill="#FF5D73" stroke="#1E2A4A" '
+    'stroke-width="6" stroke-linejoin="round"/>'
+    '<path d="M150 330 L150 490 M90 400 L210 400" stroke="#1E2A4A" stroke-width="4"/>'
+    '<path d="M150 490 C 120 540 190 570 150 620 C 120 660 180 690 160 740" fill="none" '
+    'stroke="#1E2A4A" stroke-width="4" stroke-linecap="round"/>'
+    '<path d="M135 545 l30 -10 l-5 20 Z M135 640 l30 -10 l-5 20 Z" fill="#FFC93C" '
+    'stroke="#1E2A4A" stroke-width="3"/>'
+    + _heuvels("#7FD38B", "#4CBF6B")
+    + _huizen("#FFFFFF")
+    + _boom(80, 790)
+    + _boom(1500, 790)
+    + "</svg>"
+)
+
+SCENE_BINNEN = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" '
+    'preserveAspectRatio="xMidYMax slice">'
+    '<defs><linearGradient id="l" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#8AA9D6"/><stop offset="1" stop-color="#DCE6F4"/>'
+    "</linearGradient>"
+    '<pattern id="regen" width="60" height="80" patternUnits="userSpaceOnUse">'
+    '<path d="M20 10 l-8 22 M50 50 l-8 22" stroke="#4F78B8" stroke-width="5" '
+    'stroke-linecap="round"/></pattern></defs>'
+    '<rect width="1600" height="1000" fill="url(#l)"/>'
+    # regenboog die achter de wolken vandaan piept
+    '<g fill="none" stroke-width="26">'
+    '<path d="M1080 720 A 300 300 0 0 1 1680 720" stroke="#FF5D73"/>'
+    '<path d="M1106 720 A 274 274 0 0 1 1654 720" stroke="#FFC93C"/>'
+    '<path d="M1132 720 A 248 248 0 0 1 1628 720" stroke="#4CBF6B"/>'
+    '<path d="M1158 720 A 222 222 0 0 1 1602 720" stroke="#5EC4FF"/></g>'
+    '<rect x="0" y="230" width="1600" height="520" fill="url(#regen)" opacity=".55"/>'
+    + _wolk(260, 200, "#F3F6FB", 1.2)
+    + _wolk(760, 150, "#E6ECF6", 1.1)
+    + _wolk(1250, 230, "#F3F6FB", 1.0)
+    + _heuvels("#86C495", "#5FAE72")
+    + _huizen("#FFE27A")
+    + _boom(80, 790)
+    + _boom(1500, 790)
+    + "</svg>"
+)
+
+
+# --- Stoepkrijt: tegels met krijttekeningen ----------------------------------
+
+KRIJT_TEKENINGEN = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="560" height="560" viewBox="0 0 560 560">'
+    '<defs><filter id="k"><feTurbulence type="fractalNoise" baseFrequency="0.9" '
+    'numOctaves="2"/><feDisplacementMap in="SourceGraphic" scale="3"/></filter></defs>'
+    '<g filter="url(#k)" fill="none" stroke-width="6" stroke-linecap="round" '
+    'stroke-linejoin="round" opacity=".65">'
+    # zon
+    '<g stroke="#FFE066"><circle cx="90" cy="90" r="34"/>'
+    + "".join(
+        f'<path d="M90 36 L90 18" transform="rotate({h} 90 90)"/>' for h in range(0, 360, 45)
+    )
+    + "</g>"
+    # ster
+    '<path stroke="#7CC6FF" d="M400 40 L414 78 L455 80 L423 104 L434 144 L400 120 '
+    'L366 144 L377 104 L345 80 L386 78 Z"/>'
+    # hart
+    '<path stroke="#FF8FB8" d="M270 300 C 230 270 220 230 250 220 C 265 215 270 230 270 240 '
+    'C 270 230 275 215 290 220 C 320 230 310 270 270 300 Z"/>'
+    # bloem
+    '<g stroke="#FF8FB8"><circle cx="470" cy="400" r="14"/>'
+    + "".join(
+        f'<ellipse cx="470" cy="372" rx="12" ry="16" transform="rotate({h} 470 400)"/>'
+        for h in range(0, 360, 60)
+    )
+    + '</g><path stroke="#7EE0B5" d="M470 430 C 465 470 475 490 470 530 M470 480 C 450 470 440 475 432 462"/>'
+    # spiraal
+    '<path stroke="#7EE0B5" d="M100 420 m0 0 a10 10 0 1 1 10 10 a20 20 0 1 1 -20 -20 '
+    'a30 30 0 1 1 30 30 a40 40 0 1 1 -40 -40"/>'
+    # pijltje
+    '<path stroke="#FFE066" d="M200 470 C 250 440 300 500 350 470 M335 455 L352 470 L332 482"/>'
+    "</g></svg>"
+)
+
+
+# --- CSS ---------------------------------------------------------------------
+
+BASIS = """
+[data-testid='stMain'] button { min-height: 40px; }
+[data-testid='stHeader'] { background: transparent; }
+.bsw-kop { margin: 1.6rem 0 .6rem;
+           font-size: 1.6rem; line-height: 1.2; }
+.bsw-oordeel { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;
+               justify-content: space-between; padding: 1.2rem 1.4rem; margin: 1rem 0 .6rem; }
+.bsw-oordeel-tekst { flex: 1 1 12rem; }
+.bsw-oordeel-icoon { font-size: 2.8rem; line-height: 1; }
+.bsw-oordeel-titel { font-size: 1.7rem; line-height: 1.15; margin-top: .4rem; }
+.bsw-score { text-align: center; margin: 0 auto; }
+.bsw-score-rondje { width: 6rem; height: 6rem; border-radius: 50%; display: flex;
+                    flex-direction: column; justify-content: center; align-items: center;
+                    margin: 0 auto; }
+.bsw-score-getal { font-size: 2.2rem; font-weight: 700; line-height: 1; }
+.bsw-score-van { font-size: .8rem; }
+.bsw-score-tekst { font-weight: 700; margin-top: .35rem; }
+.bsw-plaatjes { font-size: 1.45rem; letter-spacing: .08rem; }
+.bsw-idee { display: flex; gap: 1rem; align-items: center; padding: .9rem 1.1rem; margin: .7rem 0; }
+.bsw-idee-emoji { font-size: 2rem; line-height: 1; flex: none; display: grid;
+                  place-items: center; width: 3.4rem; height: 3.4rem; }
+.bsw-idee-naam { font-size: 1.2rem; font-weight: 700; }
+/* Streamlit verpakt de inhoud van een kop in een extra span. */
+.bsw-kop > span:first-child { display: inline-flex; align-items: center; gap: .6rem; }
+.bsw-idee-kans { font-size: .9rem; margin-top: .2rem; opacity: .8; }
+.bsw-tegels { display: flex; flex-wrap: wrap; gap: .9rem; margin: .6rem 0; }
+.bsw-tegel { flex: 1 1 9rem; padding: 1rem 1.1rem; }
+.bsw-tegel-getal { font-size: 2rem; font-weight: 700; }
+"""
+
+ZONNIG_CSS = """
+.stApp { background: #DDF3FF __SCENE__ center bottom / cover fixed no-repeat; }
+.stApp, .stApp p, .stApp label, .stApp input, .stApp button, .stApp li,
+.stApp [data-testid='stMarkdownContainer'] {
+  font-family: 'Lexend', sans-serif; color: #1E2A4A; }
+.stApp h1, .bsw-kop, .bsw-oordeel-titel, .bsw-score-getal, .bsw-tegel-getal, .bsw-idee-naam {
+  font-family: 'Fredoka', sans-serif !important; font-weight: 600; color: #1E2A4A; }
+[data-testid='stMainBlockContainer'] {
+  background: #FFFFFF; border: 4px solid #1E2A4A; border-radius: 28px;
+  box-shadow: 8px 8px 0 #1E2A4A; margin: 2.5rem auto 4rem; padding: 2rem 2rem 2.5rem;
+  max-width: 46rem; }
+.stApp h1 { font-size: 2.6rem; line-height: 1.05; }
+.bsw-oordeel { border: 4px solid #1E2A4A; border-radius: 22px; box-shadow: 5px 5px 0 #1E2A4A; }
+.bsw-oordeel--buiten { background: #FFF3C4; }
+.bsw-oordeel--binnen { background: #DCE6F4; }
+.bsw-score-rondje { border: 4px solid #1E2A4A; color: #FFFFFF; }
+.bsw-score--groen .bsw-score-rondje { background: #2E9E4F; }
+.bsw-score--oranje .bsw-score-rondje { background: #EF7A1A; }
+.bsw-score--rood .bsw-score-rondje { background: #D93A3A; }
+.bsw-score--groen .bsw-score-tekst { color: #1F7A3A; }
+.bsw-score--oranje .bsw-score-tekst { color: #B4530A; }
+.bsw-score--rood .bsw-score-tekst { color: #B42727; }
+.bsw-idee { background: #FFFFFF; border: 3px solid #1E2A4A; border-radius: 18px;
+            box-shadow: 4px 4px 0 #1E2A4A; }
+.bsw-idee-emoji { border-radius: 50%; border: 3px solid #1E2A4A; }
+.bsw-idee--buiten .bsw-idee-emoji { background: #C8F0D2; }
+.bsw-idee--binnen .bsw-idee-emoji { background: #E4D9FF; }
+.bsw-idee--regen .bsw-idee-emoji { background: #CDE9FF; }
+.bsw-idee--heet .bsw-idee-emoji { background: #FFE0B8; }
+.bsw-tegel { border: 3px solid #1E2A4A; border-radius: 18px; }
+.bsw-tegel--buiten { background: #FFF3C4; }
+.bsw-tegel--binnen { background: #DCE6F4; }
+[data-testid='stForm'], [data-testid='stExpander'] details {
+  border: 3px solid #1E2A4A; border-radius: 18px; }
+[data-testid='stBaseButton-primary'], [data-testid='stBaseButton-primaryFormSubmit'],
+[data-testid='stBaseButton-segmented_controlActive'] {
+  background: #FF5D73; color: #FFFFFF; border: 3px solid #1E2A4A; border-radius: 14px;
+  box-shadow: 3px 3px 0 #1E2A4A; font-weight: 700; }
+[data-testid='stBaseButton-secondary'], [data-testid='stBaseButton-segmented_control'] {
+  background: #FFFFFF; color: #1E2A4A; border: 3px solid #1E2A4A; border-radius: 14px; }
+[data-testid='stBaseButton-primary'] p, [data-testid='stBaseButton-primaryFormSubmit'] p,
+[data-testid='stBaseButton-segmented_controlActive'] p { color: #FFFFFF; font-weight: 700; }
+[data-testid='stBaseButton-secondary']:hover, [data-testid='stBaseButton-segmented_control']:hover {
+  background: #FFF3C4; border-color: #1E2A4A; color: #1E2A4A; }
+[data-testid='stAlertContainer'] { border-radius: 14px; }
+.stApp [data-testid='stCaptionContainer'], .stApp [data-testid='stCaptionContainer'] p {
+  color: #46547A; }
+@media (max-width: 640px) {
+  [data-testid='stMainBlockContainer'] { margin: 1rem .6rem 2rem; padding: 1.2rem 1rem 1.6rem;
+    border-radius: 22px; box-shadow: 5px 5px 0 #1E2A4A; }
+  .stApp h1 { font-size: 2.1rem; }
+}
+"""
+
+KRIJT_CSS = """
+.stApp {
+  background-color: #C9D1D6;
+  background-image: __TEKENINGEN__,
+    linear-gradient(#B3BCC2 3px, transparent 3px),
+    linear-gradient(90deg, #B3BCC2 3px, transparent 3px);
+  background-size: 560px 560px, 140px 140px, 140px 140px;
+  background-attachment: fixed;
+}
+.stApp, .stApp p, .stApp label, .stApp input, .stApp button, .stApp li,
+.stApp [data-testid='stMarkdownContainer'] {
+  font-family: 'Lexend', sans-serif; color: #263238; }
+.stApp h1, .bsw-kop, .bsw-oordeel-titel, .bsw-idee-naam, .bsw-score-getal, .bsw-tegel-getal {
+  font-family: 'Gochi Hand', cursive !important; font-weight: 400; color: #263238; }
+.stApp h1 { font-size: 3.2rem; line-height: 1; }
+.bsw-kop { font-size: 2rem; }
+.bsw-oordeel-titel { font-size: 2.2rem; }
+.bsw-idee-naam { font-size: 1.55rem; }
+.bsw-score-getal { font-size: 2.6rem; }
+.bsw-tegel-getal { font-size: 2.5rem; }
+/* hinkelbaan: de stappen zijn genummerde vakken */
+.bsw-hink { display: inline-grid; place-items: center; width: 2.6rem; height: 2.6rem;
+            border: 4px solid #FDFDF8; color: #263238; background: #FFE066;
+            font-family: 'Gochi Hand', cursive; font-size: 1.7rem; flex: none;
+            border-radius: 6px 3px 8px 4px; transform: rotate(-3deg); }
+.bsw-hink--2 { background: #FF8FB8; transform: rotate(2deg); }
+.bsw-hink--3 { background: #7EE0B5; transform: rotate(-1deg); }
+.bsw-vak { background: rgba(253, 253, 248, .78); border: 4px dashed #FDFDF8;
+                border-radius: 255px 18px 225px 18px / 18px 225px 18px 255px; }
+.bsw-oordeel { border-width: 5px; }
+.bsw-oordeel--buiten { border-color: #FFE066; border-style: solid; }
+.bsw-oordeel--binnen { border-color: #7CC6FF; border-style: solid; }
+.bsw-score-rondje { background: transparent; border: 5px solid; color: #263238;
+                    border-radius: 48% 52% 50% 50% / 52% 48% 52% 48%; }
+.bsw-score--groen .bsw-score-rondje { border-color: #2E9E4F; background: #D6F5DF; }
+.bsw-score--oranje .bsw-score-rondje { border-color: #EF7A1A; background: #FFE6CC; }
+.bsw-score--rood .bsw-score-rondje { border-color: #D93A3A; background: #FFD9D9; }
+.bsw-score--groen .bsw-score-tekst { color: #1F7A3A; }
+.bsw-score--oranje .bsw-score-tekst { color: #A64B08; }
+.bsw-score--rood .bsw-score-tekst { color: #B42727; }
+.bsw-idee--buiten { border-color: #7EE0B5; }
+.bsw-idee--binnen { border-color: #C3A6FF; }
+.bsw-idee--regen { border-color: #7CC6FF; }
+.bsw-idee--heet { border-color: #FFB347; }
+.bsw-tegel--buiten { border-color: #FFE066; }
+.bsw-tegel--binnen { border-color: #7CC6FF; }
+[data-testid='stForm'], [data-testid='stExpander'] details {
+  background: rgba(253, 253, 248, .7); border: 4px dashed #FDFDF8; border-radius: 18px; }
+[data-testid='stBaseButton-primary'], [data-testid='stBaseButton-primaryFormSubmit'],
+[data-testid='stBaseButton-segmented_controlActive'] {
+  background: #FF8FB8; color: #263238; border: 4px solid #FDFDF8; border-radius: 12px; }
+[data-testid='stBaseButton-secondary'], [data-testid='stBaseButton-segmented_control'] {
+  background: rgba(253, 253, 248, .85); color: #263238; border: 4px dashed #FDFDF8;
+  border-radius: 12px; }
+[data-testid='stBaseButton-primary'] p, [data-testid='stBaseButton-primaryFormSubmit'] p,
+[data-testid='stBaseButton-segmented_controlActive'] p { font-weight: 700; }
+[data-testid='stBaseButton-secondary']:hover, [data-testid='stBaseButton-segmented_control']:hover {
+  background: #FFE066; color: #263238; border-color: #FDFDF8; }
+.stApp [data-testid='stCaptionContainer'], .stApp [data-testid='stCaptionContainer'] p {
+  color: #37474F; }
+@media (max-width: 640px) { .stApp h1 { font-size: 2.6rem; } }
+"""
+
+
+def css(stijl: str, soort: str) -> str:
+    """De <style>-blokken voor een stijl; `soort` is "buiten" of "binnen"."""
+    if stijl == KRIJT:
+        eigen = KRIJT_CSS.replace("__TEKENINGEN__", _svg_url(KRIJT_TEKENINGEN))
+    else:
+        scene = SCENE_BINNEN if soort == "binnen" else SCENE_BUITEN
+        eigen = ZONNIG_CSS.replace("__SCENE__", _svg_url(scene))
+    return f"<style>{FONTS}{BASIS}{eigen}</style>"
+
+
+# ======================================================================
+# Bestand: bijwerken.py
+# ======================================================================
+
+"""Vult knmi.db aan met de nieuwste daggegevens van het KNMI.
+
+Gebruik: python3 bijwerken.py
+
+Maakt eerst een reservekopie (knmi.db.bak). Daarna worden voor alle stations
+die nog meten de dagen na de laatste meetdag opgehaald en toegevoegd.
+Herstart de app daarna, zodat de periode meeschuift.
+"""
+
+import shutil
+import sqlite3
+from datetime import date, timedelta
+from pathlib import Path
+
+import requests
+
+from knmi.db import DB_PATH
+
+KNMI_URL = "https://www.daggegevens.knmi.nl/klimatologie/daggegevens"
+
+
+def actieve_stations(con: sqlite3.Connection) -> dict[int, date]:
+    """Stations met metingen in het afgelopen jaar, met hun laatste meetdag."""
+    rijen = con.execute(
+        "SELECT STN, MAX(datum) FROM metingen GROUP BY STN "
+        "HAVING MAX(datum) >= date((SELECT MAX(datum) FROM metingen), '-1 year')"
+    ).fetchall()
+    return {stn: date.fromisoformat(laatste) for stn, laatste in rijen}
+
+
+def haal_op(stations: list[int], begin: date, eind: date, http=requests) -> list[dict]:
+    antwoord = http.post(
+        KNMI_URL,
+        data={
+            "stns": ":".join(map(str, stations)),
+            "start": begin.strftime("%Y%m%d"),
+            "end": eind.strftime("%Y%m%d"),
+            "vars": "ALL",
+            "fmt": "json",
+        },
+        timeout=60,
+    )
+    antwoord.raise_for_status()
+    return antwoord.json()
+
+
+def bijwerken(pad: Path = DB_PATH, vandaag: date | None = None, http=requests) -> int:
+    """Voegt nieuwe dagen toe en geeft terug hoeveel rijen erbij kwamen."""
+    vandaag = vandaag or date.today()
+    with sqlite3.connect(pad) as con:
+        laatste = actieve_stations(con)
+        if not laatste:
+            return 0
+        begin = min(laatste.values()) + timedelta(days=1)
+        eind = vandaag - timedelta(days=1)
+        if begin > eind:
+            return 0
+
+        items = haal_op(sorted(laatste), begin, eind, http=http)
+        kolommen = [r[1] for r in con.execute("PRAGMA table_info(metingen)")]
+        meetwaarden = [k for k in kolommen if k not in ("STN", "datum")]
+        rijen = [
+            (item["station_code"], item["date"][:10], *(item.get(k) for k in meetwaarden))
+            for item in items
+            if item["date"][:10] > laatste.get(item["station_code"], date.max).isoformat()
+        ]
+        if not rijen:
+            return 0
+
+        shutil.copy2(pad, pad.with_suffix(".db.bak"))
+        plaatshouders = ", ".join("?" * len(kolommen))
+        con.executemany(
+            f"INSERT OR IGNORE INTO metingen ({', '.join(kolommen)}) VALUES ({plaatshouders})",
+            rijen,
+        )
+        return con.total_changes
+
+
+if __name__ == "__main__":
+    toegevoegd = bijwerken()
+    with sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True) as con:
+        nieuwste = con.execute("SELECT MAX(datum) FROM metingen").fetchone()[0]
+    print(f"{toegevoegd} dagen toegevoegd. Nieuwste meetdag: {nieuwste}.")
+
+
+# ======================================================================
+# Bestand: knmi/__init__.py
+# ======================================================================
+
+"""Logica voor de Buitenspeelwijzer (los van Streamlit, zodat het testbaar is)."""
+
+
+# ======================================================================
+# Bestand: knmi/activiteiten.py
+# ======================================================================
+
+"""Buitenactiviteiten en binnenopdrachten kiezen op basis van historische metingen.
+
+Eenheden in de database (KNMI):
+  TX  maximumtemperatuur      in 0,1 °C
+  RH  neerslag                in 0,1 mm (-1 = minder dan 0,05 mm)
+  UG  relatieve luchtvochtigheid in %
+  FG  gemiddelde windsnelheid in 0,1 m/s
+  FXX hoogste windstoot       in 0,1 m/s
+"""
+
+import random
+from dataclasses import dataclass
+from typing import Callable
+
+from knmi.weer import is_buitenspeeldag
+
+
+def droog(m: dict) -> bool:
+    """Minder dan 1 mm regen."""
+    rh = m.get("RH")
+    return rh is not None and rh < 10
+
+
+def regen(m: dict, mm: float = 1) -> bool:
+    rh = m.get("RH")
+    return rh is not None and rh >= mm * 10
+
+
+def warmer_dan(m: dict, graden: float) -> bool:
+    tx = m.get("TX")
+    return tx is not None and tx >= graden * 10
+
+
+def heet(m: dict) -> bool:
+    """Boven 25 °C, of benauwd: boven 22 °C met hoge luchtvochtigheid."""
+    ug = m.get("UG")
+    return warmer_dan(m, 25) or (warmer_dan(m, 22) and ug is not None and ug >= 80)
+
+
+def wind_hoogstens(m: dict, ms: float) -> bool:
+    fg = m.get("FG")
+    return fg is not None and fg <= ms * 10
+
+
+def winderig(m: dict) -> bool:
+    """Flink wat wind (gemiddeld 4 m/s of meer) zonder zware windstoten."""
+    fg = m.get("FG")
+    return fg is not None and fg >= 40 and veilig(m)
+
+
+def veilig(m: dict) -> bool:
+    """Geen zware windstoten (onder 15 m/s, ongeveer 54 km/u)."""
+    fxx = m.get("FXX")
+    return fxx is not None and fxx < 150
+
+
+def mild_en_droog(m: dict) -> bool:
+    return droog(m) and not heet(m) and veilig(m)
+
+
+@dataclass(frozen=True)
+class Activiteit:
+    naam: str
+    emoji: str
+    tip: str
+    past_bij: Callable[[dict], bool]
+    soort: str = "mild"  # mild, heet, wind of regen
+
+    def geschikt(self, meting: dict) -> bool:
+        """Alleen op een buitenspeeldag, en als het weer bij de activiteit past."""
+        return is_buitenspeeldag(meting.get("TX")) and self.past_bij(meting)
+
+
+ACTIVITEITEN: tuple[Activiteit, ...] = (
+    # Mooi en mild
+    Activiteit("Fietsen", "🚲", "Maak een rondje door de wijk of naar het park.",
+               lambda m: mild_en_droog(m) and wind_hoogstens(m, 8)),
+    Activiteit("Voetballen", "⚽", "Twee jassen op de grond en je hebt een goal!", mild_en_droog),
+    Activiteit("Wandelen", "🥾", "Ga op ontdekking in het bos of park.", mild_en_droog),
+    Activiteit("Stoepkrijten", "🖍️", "Teken een hinkelbaan of een groot kunstwerk.", mild_en_droog),
+    Activiteit("Verstoppertje of tikkertje", "🙈", "Vraag de buurkinderen mee!", mild_en_droog),
+    Activiteit("Skeeleren of steppen", "🛼", "Zoek een glad stuk stoep of een plein.",
+               lambda m: mild_en_droog(m) and wind_hoogstens(m, 6)),
+    Activiteit("Hinkelen", "🦘", "Krijt een baan en gooi een steentje.", mild_en_droog),
+    Activiteit("Trefbal", "🏐", "Met een zachte bal en minstens vier kinderen.", mild_en_droog),
+    Activiteit("Badminton", "🏸", "Lukt het best als er bijna geen wind is.",
+               lambda m: mild_en_droog(m) and wind_hoogstens(m, 3)),
+    Activiteit("Speurtocht door de wijk", "🔎", "Zoek iets roods, iets ronds en een kat.",
+               mild_en_droog),
+    Activiteit("Basketbal of pleintjesvoetbal", "🏀", "Ga naar het pleintje bij jou in de buurt.",
+               mild_en_droog),
+    Activiteit("Touwtjespringen of elastieken", "🪢", "Hoe vaak kun je achter elkaar springen?",
+               mild_en_droog),
+    Activiteit("Fietsparcours bouwen", "🚧", "Gebruik stoepkrijt en pionnen voor bochtjes.",
+               lambda m: mild_en_droog(m) and wind_hoogstens(m, 6)),
+    # Warm en zonnig: water en schaduw
+    Activiteit("Waterpistool-gevecht", "💦", "Lekker afkoelen in de tuin of op straat.",
+               lambda m: droog(m) and heet(m),
+               soort="heet"),
+    Activiteit("Waterballonnen gooien", "🎈", "Ruim de stukjes ballon daarna wel op!",
+               lambda m: droog(m) and heet(m),
+               soort="heet"),
+    Activiteit("Knikkeren in de schaduw", "🔵", "Zoek een plekje onder een boom.",
+               lambda m: heet(m) and veilig(m),
+               soort="heet"),
+    Activiteit("Hut bouwen onder de bomen", "🏕️", "Met takken, een laken en wat touw.",
+               lambda m: heet(m) and veilig(m),
+               soort="heet"),
+    Activiteit("Beestjesjacht", "🐞", "Hoeveel verschillende beestjes vind jij?",
+               lambda m: droog(m) and warmer_dan(m, 18) and wind_hoogstens(m, 6)),
+    # Winderig
+    Activiteit("Vliegeren", "🪁", "Hoe hoger de wind, hoe hoger je vlieger.",
+               lambda m: droog(m) and winderig(m),
+               soort="wind"),
+    Activiteit("Papieren vliegtuigjes", "✈️", "Wiens vliegtuigje vliegt het verst met de wind mee?",
+               lambda m: droog(m) and winderig(m),
+               soort="wind"),
+    # Slecht weer
+    Activiteit("Plassen springen", "🌧️", "Regenlaarzen aan en springen maar!",
+               lambda m: regen(m, 2) and veilig(m),
+               soort="regen"),
+    Activiteit("Bootjes laten varen", "⛵", "Vouw een papieren bootje en laat het in de goot varen.",
+               lambda m: regen(m, 2) and veilig(m),
+               soort="regen"),
+    Activiteit("Regenwormen zoeken", "🪱", "Na regen komen ze naar boven.",
+               lambda m: regen(m, 1),
+               soort="regen"),
+    Activiteit("Regenwandeling", "☂️", "Pak je paraplu en luister naar de regen.",
+               lambda m: regen(m, 1) and veilig(m),
+               soort="regen"),
+)
+
+BINNENOPDRACHTEN: tuple[tuple[str, str, str], ...] = (
+    ("Hut bouwen", "🛋️", "Bouw een hut van kussens en dekens."),
+    ("Knutselen", "✂️", "Tekenen, kleien of knippen en plakken."),
+    ("Bordspel of kaartspel", "🎲", "Daag iemand uit voor een potje."),
+    ("Puzzelen", "🧩", "Lukt het je om hem in één middag af te maken?"),
+    ("Speurtocht door het huis", "🗺️", "Verstop een schat en teken een kaart."),
+    ("Toneelstukje of poppenkast", "🎭", "Bedenk een verhaal en speel het na."),
+    ("Koken of bakken", "🧁", "Bak samen met een ouder iets lekkers."),
+    ("Lezen of een strip tekenen", "📚", "Verzin je eigen superheld."),
+    ("De vloer is lava!", "🌋", "Spring van kussen naar kussen."),
+    ("Proefjes doen", "🧪", "Maak een vulkaan van bakpoeder en azijn."),
+)
+
+
+@dataclass(frozen=True)
+class Advies:
+    naam: str
+    emoji: str
+    tip: str
+    jaren: int | None = None  # in hoeveel jaren het weer erbij paste (buiten)
+
+
+def _tel(metingen: list[dict], loting: random.Random, kandidaten) -> list[tuple]:
+    scores = [(sum(a.geschikt(m) for m in metingen), loting.random(), a) for a in kandidaten]
+    scores.sort(key=lambda s: (-s[0], s[1]))
+    return scores
+
+
+def top_activiteiten(metingen: list[dict], aantal: int = 3, seed: int = 0) -> list[Advies]:
+    """De activiteiten die in de meeste jaren bij het weer pasten.
+
+    Bij gelijke stand beslist een vaste (seed) loting, zodat je op verschillende
+    dagen ook verschillende ideeën ziet.
+    """
+    scores = _tel(metingen, random.Random(seed), ACTIVITEITEN)
+    return [
+        Advies(a.naam, a.emoji, a.tip, jaren)
+        for jaren, _, a in scores[:aantal]
+        if jaren > 0
+    ]
+
+
+PLAN_B_MIN_JAREN = 3
+
+
+def plan_b(
+    metingen: list[dict], soort: str, al_getoond: set[str], seed: int = 0
+) -> Advies | None:
+    """De activiteit van één soort (bijv. regen of heet) die het vaakst paste,
+    als dat in minstens 3 jaren zo was en hij nog niet getoond wordt."""
+    kandidaten = [a for a in ACTIVITEITEN if a.soort == soort and a.naam not in al_getoond]
+    scores = _tel(metingen, random.Random(seed), kandidaten)
+    if not scores or scores[0][0] < PLAN_B_MIN_JAREN:
+        return None
+    jaren, _, a = scores[0]
+    return Advies(a.naam, a.emoji, a.tip, jaren)
+
+
+def binnenopdrachten(aantal: int = 3, seed: int = 0) -> list[Advies]:
+    """Een vaste (seed) willekeurige keuze uit de binnenopdrachten."""
+    gekozen = random.Random(seed).sample(BINNENOPDRACHTEN, aantal)
+    return [Advies(naam, emoji, tip) for naam, emoji, tip in gekozen]
+
+
+# ======================================================================
+# Bestand: knmi/datum.py
+# ======================================================================
+
+"""Dagkeuze: komend weekend, kalenderdag en Nederlandse labels."""
+
+from datetime import date, timedelta
+
+DAGEN = ("maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag")
+MAANDEN = (
+    "januari", "februari", "maart", "april", "mei", "juni",
+    "juli", "augustus", "september", "oktober", "november", "december",
+)
+ZATERDAG, ZONDAG = 5, 6
+
+
+def komend_weekend(vandaag: date) -> tuple[date, date]:
+    """De twee eerstvolgende weekenddagen, vandaag meegerekend."""
+    wd = vandaag.weekday()
+    if wd == ZATERDAG:
+        return vandaag, vandaag + timedelta(days=1)
+    if wd == ZONDAG:
+        return vandaag, vandaag + timedelta(days=6)
+    zaterdag = vandaag + timedelta(days=ZATERDAG - wd)
+    return zaterdag, zaterdag + timedelta(days=1)
+
+
+def is_schrikkeldag(d: date) -> bool:
+    return d.month == 2 and d.day == 29
+
+
+def kalenderdag(d: date) -> str:
+    """"MM-DD" voor de database; 29 februari gebruikt 28 februari."""
+    if is_schrikkeldag(d):
+        return "02-28"
+    return f"{d.month:02d}-{d.day:02d}"
+
+
+def dag_label(d: date) -> str:
+    """Bijvoorbeeld "zaterdag 25 oktober"."""
+    return f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month - 1]}"
+
+
+def knop_label(d: date) -> str:
+    """Kort label voor een knop, bijvoorbeeld "Zaterdag 25 okt"."""
+    return f"{DAGEN[d.weekday()].capitalize()} {d.day} {MAANDEN[d.month - 1][:3]}"
+
+
+def datum_zonder_jaar(d: date) -> str:
+    """Bijvoorbeeld "25 oktober"."""
+    return f"{d.day} {MAANDEN[d.month - 1]}"
+
+
+def datum_met_jaar(d: date) -> str:
+    """Bijvoorbeeld "21 oktober 2026"."""
+    return f"{datum_zonder_jaar(d)} {d.year}"
+
+
+# ======================================================================
+# Bestand: knmi/db.py
+# ======================================================================
+
+"""Read-only toegang tot knmi.db."""
+
+import sqlite3
+from dataclasses import dataclass
+from datetime import date, timedelta
+from pathlib import Path
+
+DB_PATH = Path(__file__).resolve().parent.parent / "knmi.db"
+
+# De referentieperiode schuift mee: altijd de laatste 30 jaar tot en met
+# de nieuwste meetdag in de database.
+AANTAL_JAREN = 30
+
+# Variabelen die de app gebruikt; een station moet ze allemaal goed gemeten hebben.
+BENODIGDE_VARIABELEN = ("TX", "RH", "SQ", "UG", "FG", "FXX")
+MIN_DEKKING = 0.80
+
+# Kolommen die we per dag ophalen.
+METING_KOLOMMEN = ("TX", "TN", "TG", "RH", "DR", "SQ", "UG", "FG", "FXX")
+
+
+@dataclass(frozen=True)
+class Station:
+    stn: int
+    naam: str
+    lat: float
+    lon: float
+
+
+@dataclass(frozen=True)
+class Periode:
+    begin: date
+    eind: date
+
+    @classmethod
+    def eindigend_op(cls, eind: date) -> "Periode":
+        """De 30 jaar die eindigen op `eind` (bijv. 22-10-1996 t/m 21-10-2026)."""
+        return cls(_jaren_terug(eind, AANTAL_JAREN) + timedelta(days=1), eind)
+
+    @property
+    def aantal_dagen(self) -> int:
+        return (self.eind - self.begin).days + 1
+
+    def datums_van_kalenderdag(self, mmdd: str) -> list[date]:
+        """Alle datums met deze maand en dag binnen de periode (30 stuks)."""
+        maand, dag = int(mmdd[:2]), int(mmdd[3:])
+        datums = []
+        for jaar in range(self.begin.year, self.eind.year + 1):
+            try:
+                d = date(jaar, maand, dag)
+            except ValueError:  # 29 februari in een gewoon jaar
+                continue
+            if self.begin <= d <= self.eind:
+                datums.append(d)
+        return datums
+
+
+def _jaren_terug(d: date, jaren: int) -> date:
+    try:
+        return d.replace(year=d.year - jaren)
+    except ValueError:  # 29 februari
+        return d.replace(year=d.year - jaren, day=28)
+
+
+def verbind(pad: Path = DB_PATH) -> sqlite3.Connection:
+    """Open de database alleen-lezen, zodat de app er nooit in kan schrijven."""
+    return sqlite3.connect(f"file:{pad}?mode=ro", uri=True)
+
+
+def laatste_meetdag(pad: Path = DB_PATH) -> date:
+    with verbind(pad) as con:
+        return date.fromisoformat(con.execute("SELECT MAX(datum) FROM metingen").fetchone()[0])
+
+
+def huidige_periode(pad: Path = DB_PATH) -> Periode:
+    return Periode.eindigend_op(laatste_meetdag(pad))
+
+
+def bruikbare_stations(periode: Periode, pad: Path = DB_PATH) -> list[Station]:
+    """Stations die in de periode voor elke benodigde variabele
+    van ten minste 80% van de dagen een meting hebben."""
+    tellingen = ", ".join(f"COUNT(m.{v})" for v in BENODIGDE_VARIABELEN)
+    sql = f"""
+        SELECT s.stn, s.naam, s.lat, s.lon, {tellingen}
+        FROM stations s
+        LEFT JOIN metingen m
+          ON m.STN = s.stn AND m.datum BETWEEN ? AND ?
+        GROUP BY s.stn
+        ORDER BY s.naam
+    """
+    with verbind(pad) as con:
+        rijen = con.execute(
+            sql, (periode.begin.isoformat(), periode.eind.isoformat())
+        ).fetchall()
+
+    stations = []
+    for stn, naam, lat, lon, *aantallen in rijen:
+        if all(a / periode.aantal_dagen >= MIN_DEKKING for a in aantallen):
+            stations.append(Station(stn, naam, lat, lon))
+    return stations
+
+
+def metingen_op_kalenderdag(
+    stn: int, mmdd: str, periode: Periode, pad: Path = DB_PATH
+) -> list[dict]:
+    """Metingen van één kalenderdag ("MM-DD") voor elk jaar in de periode.
+
+    Jaren zonder rij in de database komen terug met lege (None) waarden,
+    zodat er altijd precies één regel per jaar is.
+    """
+    kolommen = ", ".join(METING_KOLOMMEN)
+    sql = f"""
+        SELECT datum, {kolommen}
+        FROM metingen
+        WHERE STN = ? AND substr(datum, 6, 5) = ? AND datum BETWEEN ? AND ?
+    """
+    with verbind(pad) as con:
+        rijen = con.execute(
+            sql, (stn, mmdd, periode.begin.isoformat(), periode.eind.isoformat())
+        ).fetchall()
+
+    per_datum = {r[0]: dict(zip(METING_KOLOMMEN, r[1:])) for r in rijen}
+    leeg = dict.fromkeys(METING_KOLOMMEN)
+    return [
+        {"jaar": d.year, **per_datum.get(d.isoformat(), leeg)}
+        for d in periode.datums_van_kalenderdag(mmdd)
+    ]
+
+
+def max_temperaturen(
+    stn: int, periode: Periode, pad: Path = DB_PATH
+) -> dict[str, float | None]:
+    """Maximumtemperatuur (TX) per datum ("YYYY-MM-DD") in de periode."""
+    with verbind(pad) as con:
+        rijen = con.execute(
+            "SELECT datum, TX FROM metingen WHERE STN = ? AND datum BETWEEN ? AND ?",
+            (stn, periode.begin.isoformat(), periode.eind.isoformat()),
+        ).fetchall()
+    return dict(rijen)
+
+
+# ======================================================================
+# Bestand: knmi/locatie.py
+# ======================================================================
+
+"""Plaats of postcode opzoeken en het dichtstbijzijnde weerstation kiezen."""
+
+import math
+import re
+from dataclasses import dataclass
+
+import requests
+
+from knmi.db import Station
+
+PDOK_URL = "https://api.pdok.nl/bzk/locatieserver/search/v3_1/free"
+POSTCODE_PATROON = re.compile(r"^\s*(\d{4})\s?([A-Za-z]{2})\s*$")
+VER_WEG_KM = 50
+
+
+class LocatieServiceFout(Exception):
+    """De opzoekdienst is niet bereikbaar of gaf een onverwacht antwoord."""
+
+
+@dataclass(frozen=True)
+class Locatie:
+    naam: str
+    lat: float
+    lon: float
+
+
+def normaliseer_postcode(tekst: str) -> str | None:
+    """Geeft "3511AB" terug voor "3511 ab", of None als het geen postcode is."""
+    m = POSTCODE_PATROON.match(tekst)
+    return f"{m[1]}{m[2].upper()}" if m else None
+
+
+def _parse_punt(punt: str) -> tuple[float, float]:
+    """Zet "POINT(lon lat)" om naar (lat, lon)."""
+    lon, lat = punt.removeprefix("POINT(").removesuffix(")").split()
+    return float(lat), float(lon)
+
+
+def zoek_locatie(tekst: str, http=requests) -> Locatie | None:
+    """Zoek een postcode of woonplaats op via de PDOK Locatieserver.
+
+    Geeft None als er niets gevonden is; gooit LocatieServiceFout als de
+    dienst niet werkt.
+    """
+    tekst = tekst.strip()
+    if not tekst:
+        return None
+
+    postcode = normaliseer_postcode(tekst)
+    params = {
+        "q": postcode or tekst,
+        "fq": "type:postcode" if postcode else "type:woonplaats",
+        "rows": 1,
+        "fl": "weergavenaam,centroide_ll",
+    }
+    try:
+        antwoord = http.get(PDOK_URL, params=params, timeout=5)
+        antwoord.raise_for_status()
+        docs = antwoord.json()["response"]["docs"]
+    except (requests.RequestException, ValueError, KeyError) as fout:
+        raise LocatieServiceFout(str(fout)) from fout
+
+    if not docs:
+        return None
+    lat, lon = _parse_punt(docs[0]["centroide_ll"])
+    return Locatie(docs[0]["weergavenaam"], lat, lon)
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Afstand over het aardoppervlak in kilometers."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def dichtstbijzijnd_station(
+    lat: float, lon: float, stations: list[Station]
+) -> tuple[Station, float]:
+    """Het station dat het dichtst bij (lat, lon) ligt, met de afstand in km."""
+    return min(
+        ((s, haversine_km(lat, lon, s.lat, s.lon)) for s in stations),
+        key=lambda paar: paar[1],
+    )
+
+
+# ======================================================================
+# Bestand: knmi/score.py
+# ======================================================================
+
+"""Buitenspeelscore van 0–100, los van de activiteit."""
+
+from knmi.weer import is_buitenspeeldag
+
+GROEN, ORANJE, ROOD = "#2e7d32", "#ef6c00", "#c62828"
+
+SCORE_KOLOMMEN = ("TX", "RH", "SQ", "UG", "FG", "FXX")
+
+
+def jaar_score(m: dict) -> int:
+    """Score van één dag. 0 bij een binnendag of een ontbrekende meting."""
+    if any(m.get(k) is None for k in SCORE_KOLOMMEN) or not is_buitenspeeldag(m["TX"]):
+        return 0
+
+    temp = m["TX"] / 10
+    regen_mm = max(m["RH"], 0) / 10  # -1 betekent minder dan 0,05 mm
+    zon_uur = m["SQ"] / 10
+    wind = m["FG"] / 10
+    stoten = m["FXX"] / 10
+
+    score = 100.0
+    if temp < 18:
+        score -= (18 - temp) * 5
+    elif temp > 25:
+        score -= min((temp - 25) * 4, 30)
+
+    if regen_mm > 10:
+        score -= 45
+    elif regen_mm > 5:
+        score -= 30
+    elif regen_mm >= 1:
+        score -= 15
+
+    if zon_uur < 2:
+        score -= 10
+    elif zon_uur < 5:
+        score -= 5
+
+    if wind > 8:
+        score -= 20
+    elif wind > 5:
+        score -= 10
+
+    if stoten >= 20:
+        score -= 40
+    elif stoten >= 15:
+        score -= 25
+
+    if temp >= 22 and m["UG"] >= 85:
+        score -= 10
+
+    return round(min(max(score, 0), 100))
+
+
+def dag_score(metingen: list[dict]) -> int:
+    """Gemiddelde score over alle jaren."""
+    if not metingen:
+        return 0
+    return round(sum(jaar_score(m) for m in metingen) / len(metingen))
+
+
+def score_niveau(score: int) -> str:
+    """"groen", "oranje" of "rood"."""
+    if score >= 60:
+        return "groen"
+    if score >= 40:
+        return "oranje"
+    return "rood"
+
+
+LABELS = {
+    "groen": ("Top buitenspeeldag!", GROEN),
+    "oranje": ("Best oké", ORANJE),
+    "rood": ("Niet zo goed", ROOD),
+}
+
+
+def score_label(score: int) -> tuple[str, str]:
+    """(tekst, kleur) voor een score."""
+    return LABELS[score_niveau(score)]
+
+
+# ======================================================================
+# Bestand: knmi/weer.py
+# ======================================================================
+
+"""Bepalen of een kalenderdag historisch een buitenspeeldag is."""
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+
+# TX staat in tienden van graden: 150 = 15,0 °C.
+DREMPEL_TX = 150
+
+BUITEN = "buiten"
+BINNEN = "binnen"
+
+
+@dataclass(frozen=True)
+class Oordeel:
+    buitendagen: int
+    totaal: int
+    soort: str  # BUITEN of BINNEN
+    gem_max_temp: float | None  # in °C, alleen over jaren mét meting
+
+    @property
+    def tekst(self) -> str:
+        return "Meestal buitenspeelweer!" if self.soort == BUITEN else "Meestal een binnendag"
+
+
+def is_buitenspeeldag(tx: float | None) -> bool:
+    """Maximumtemperatuur van 15 °C of meer. Geen meting telt als niet geschikt."""
+    return tx is not None and tx >= DREMPEL_TX
+
+
+def buitenspeel_oordeel(metingen: list[dict]) -> Oordeel:
+    """Telt over alle jaren hoe vaak het een buitenspeeldag was."""
+    buitendagen = sum(is_buitenspeeldag(m["TX"]) for m in metingen)
+    totaal = len(metingen)
+    soort = BUITEN if totaal and buitendagen * 2 >= totaal else BINNEN
+
+    gemeten = [m["TX"] for m in metingen if m["TX"] is not None]
+    gem = sum(gemeten) / len(gemeten) / 10 if gemeten else None
+    return Oordeel(buitendagen, totaal, soort, gem)
+
+
+def van_de_tien(aantal: int, totaal: int) -> int:
+    """Zet "aantal van de totaal" om naar "x van de 10" (.5 rondt naar boven af)."""
+    if not totaal:
+        return 0
+    return int(aantal * 10 / totaal + 0.5)
+
+
+def kans_tekst(aantal: int, totaal: int) -> str:
+    """Bijvoorbeeld "7 van de 10", of "minder dan 1 van de 10"."""
+    x = van_de_tien(aantal, totaal)
+    if x == 0 and aantal > 0:
+        return "minder dan 1 van de 10"
+    return f"{x} van de 10"
+
+
+@dataclass(frozen=True)
+class Telling:
+    buiten_per_jaar: float
+    binnen_per_jaar: float
+    dagen_per_jaar: float
+
+
+def tel_speeldagen(
+    tx_per_datum: dict[str, float | None],
+    begin: date,
+    eind: date,
+    alleen_weekend: bool = False,
+) -> Telling:
+    """Gemiddeld aantal buitenspeel- en binnendagen per jaar.
+
+    Elke kalenderdatum in de periode telt mee; een datum zonder meting
+    is een binnendag.
+    """
+    buiten = dagen = 0
+    d = begin
+    while d <= eind:
+        if not alleen_weekend or d.weekday() >= 5:
+            dagen += 1
+            buiten += is_buitenspeeldag(tx_per_datum.get(d.isoformat()))
+        d += timedelta(days=1)
+
+    jaren = max(round(((eind - begin).days + 1) / 365.25), 1)
+    return Telling(buiten / jaren, (dagen - buiten) / jaren, dagen / jaren)
+
+
+# ======================================================================
+# Bestand: requirements.txt
+# ======================================================================
+
+streamlit>=1.46
+requests
+pytest
+
+
+# ======================================================================
+# Bestand: .streamlit/config.toml
+# ======================================================================
+
+[server]
+port = 3000
+address = "0.0.0.0"
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
